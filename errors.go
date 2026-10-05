@@ -13,3 +13,10 @@ var (
 	ErrDanglingRef          = errors.New("ocistore: dangling reference")
 	ErrInvalidDigest        = errors.New("ocistore: invalid digest")
 )
+
+// 引用管理相关的可区分失败原因。
+var (
+	ErrInvalidName = errors.New("ocistore: invalid repository name")
+	ErrInvalidTag  = errors.New("ocistore: invalid tag")
+	ErrRefNotFound = errors.New("ocistore: reference not registered")
+)

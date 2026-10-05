@@ -108,3 +108,38 @@ func TestGetNotFound(t *testing.T) {
 	}
 	t.Logf("missing digest=%s correctly rejected", missing)
 }
+
+func TestPutExistingStillValidatesDeclaration(t *testing.T) {
+	s := newTestStore(t)
+	content := []byte("already-in-store")
+	d := DigestOf(content)
+	if _, err := s.Put(d, int64(len(content)), bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 再写一遍、声明一致：命中去重，正常返回
+	if _, err := s.Put(d, int64(len(content)), bytes.NewReader(content)); err != nil {
+		t.Fatalf("consistent re-put should succeed: %v", err)
+	}
+
+	// 声明大小 > 实际：按截断拒绝
+	_, err := s.Put(d, int64(len(content)+1), bytes.NewReader(content))
+	if !errors.Is(err, ErrTruncated) {
+		t.Fatalf("oversized declaration on existing blob: want ErrTruncated, got %v", err)
+	}
+	// 声明大小 < 实际：按大小不符拒绝
+	_, err = s.Put(d, int64(len(content)-1), bytes.NewReader(content[:len(content)-1]))
+	if !errors.Is(err, ErrSizeMismatch) {
+		t.Fatalf("undersized declaration on existing blob: want ErrSizeMismatch, got %v", err)
+	}
+
+	// 库中内容被篡改（与摘要名不符、长度相同）：按摘要不符拒绝
+	p := filepath.Join(s.Root(), "blobs", "sha256", d.Hex())
+	if err := os.WriteFile(p, []byte("tampered-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Put(d, int64(len(content)), bytes.NewReader(content))
+	if !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("corrupted stored blob: want ErrDigestMismatch, got %v", err)
+	}
+}

@@ -32,6 +32,11 @@ type Store struct {
 
 	mu   sync.Mutex
 	pins map[Digest]int
+
+	// refsMu 保护 refs 与 refs.json 的读改写；落盘通过
+	// “写临时文件 + 原子 rename” 保证任何时刻读到完整结果。
+	refsMu sync.Mutex
+	refs   map[string]Digest // "name:tag" -> digest
 }
 
 // Open 打开（必要时创建）位于 root 的存储。
@@ -44,7 +49,11 @@ func Open(root string) (*Store, error) {
 			return nil, err
 		}
 	}
-	return &Store{root: root, pins: map[Digest]int{}}, nil
+	s := &Store{root: root, pins: map[Digest]int{}, refs: map[string]Digest{}}
+	if err := s.loadRefs(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // Root 返回存储根目录。
@@ -67,8 +76,14 @@ func (s *Store) Put(expected Digest, size int64, r io.Reader) (BlobInfo, error) 
 		return BlobInfo{}, fmt.Errorf("%w: negative declared size %d", ErrSizeMismatch, size)
 	}
 
-	// 已存在则直接命中（内容寻址，相同摘要即相同内容）。
+	// 已存在则命中（内容寻址，相同摘要即相同内容），但声明仍须与
+	// 库中实际内容一致：大小不符按 ErrTruncated/ErrSizeMismatch 拒绝，
+	// 库中内容被篡改（与摘要名不符）按 ErrDigestMismatch 拒绝，
+	// 绝不因为“库里已有一份”就放过对不上的声明。
 	if info, ok := s.stat(expected); ok {
+		if err := s.verifyExisting(expected, size, info); err != nil {
+			return BlobInfo{}, err
+		}
 		return info, nil
 	}
 
@@ -126,6 +141,29 @@ func (s *Store) stat(d Digest) (BlobInfo, bool) {
 		return BlobInfo{}, false
 	}
 	return BlobInfo{Digest: d, Size: fi.Size()}, true
+}
+
+// verifyExisting 校验声明与库中已有内容是否一致（dedup 命中路径）。
+func (s *Store) verifyExisting(expected Digest, size int64, info BlobInfo) error {
+	switch {
+	case size > info.Size:
+		return fmt.Errorf("%w: declared %d bytes, stored blob has %d", ErrTruncated, size, info.Size)
+	case size < info.Size:
+		return fmt.Errorf("%w: declared %d bytes, stored blob has %d", ErrSizeMismatch, size, info.Size)
+	}
+	f, err := os.Open(s.blobPath(expected))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	if actual := Digest("sha256:" + hex.EncodeToString(h.Sum(nil))); actual != expected {
+		return fmt.Errorf("%w: stored blob for %s hashes to %s", ErrDigestMismatch, expected, actual)
+	}
+	return nil
 }
 
 // Get 按摘要读取内容。返回的 ReadCloser 关闭前，该摘要被钉住，
