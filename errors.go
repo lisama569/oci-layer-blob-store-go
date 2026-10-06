@@ -12,4 +12,7 @@ var (
 	ErrPlatformNotFound     = errors.New("ocistore: no matching platform")
 	ErrDanglingRef          = errors.New("ocistore: dangling reference")
 	ErrInvalidDigest        = errors.New("ocistore: invalid digest")
+	ErrInvalidName          = errors.New("ocistore: invalid image name")
+	ErrInvalidTag           = errors.New("ocistore: invalid tag")
+	ErrNameNotFound         = errors.New("ocistore: name not registered")
 )

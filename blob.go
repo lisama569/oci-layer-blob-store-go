@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -39,12 +38,15 @@ func Open(root string) (*Store, error) {
 	for _, dir := range []string{
 		filepath.Join(root, "blobs", "sha256"),
 		filepath.Join(root, "tmp"),
+		filepath.Join(root, "refs"),
 	} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}
 	}
-	return &Store{root: root, pins: map[Digest]int{}}, nil
+	s := &Store{root: root, pins: map[Digest]int{}}
+	// 确保登记文件与锁文件所在目录存在（锁在首次 Tag/Lookup 时按需获取）。
+	return s, nil
 }
 
 // Root 返回存储根目录。
@@ -59,6 +61,9 @@ func (s *Store) blobPath(d Digest) string {
 // 失败原因可区分：ErrTruncated（内容不足声明大小）、
 // ErrSizeMismatch（内容超出声明大小）、ErrDigestMismatch（摘要不符）。
 // 任何失败都不会在 blobs 目录留下半成品。
+//
+// 即使声明摘要的内容在库中已存在，也仍会读完全部输入并做大小与摘要校验：
+// 声明与实际对不上时照旧返回上述错误，不会因为“库里已有一份”就放过。
 func (s *Store) Put(expected Digest, size int64, r io.Reader) (BlobInfo, error) {
 	if err := expected.Validate(); err != nil {
 		return BlobInfo{}, err
@@ -67,10 +72,7 @@ func (s *Store) Put(expected Digest, size int64, r io.Reader) (BlobInfo, error) 
 		return BlobInfo{}, fmt.Errorf("%w: negative declared size %d", ErrSizeMismatch, size)
 	}
 
-	// 已存在则直接命中（内容寻址，相同摘要即相同内容）。
-	if info, ok := s.stat(expected); ok {
-		return info, nil
-	}
+	_, existed := s.stat(expected)
 
 	tmp, err := os.CreateTemp(filepath.Join(s.root, "tmp"), "put-*")
 	if err != nil {
@@ -80,7 +82,12 @@ func (s *Store) Put(expected Digest, size int64, r io.Reader) (BlobInfo, error) 
 	defer os.Remove(tmpName) // 任何失败路径都会清理临时文件
 
 	h := sha256.New()
-	n, err := copyCounting(tmp, h, r)
+	var sink io.Writer = h
+	if !existed {
+		// 不存在时同时落临时文件；已存在时只校验输入。
+		sink = io.MultiWriter(tmp, h)
+	}
+	n, err := io.Copy(sink, r)
 	if err != nil {
 		tmp.Close()
 		return BlobInfo{}, err
@@ -97,11 +104,16 @@ func (s *Store) Put(expected Digest, size int64, r io.Reader) (BlobInfo, error) 
 		return BlobInfo{}, fmt.Errorf("%w: declared %d bytes, got %d", ErrSizeMismatch, size, n)
 	}
 
-	// 摘要校验。
+	// 摘要校验（无论库中是否已存在，都以实际读到的内容为准）。
 	sum := h.Sum(nil)
 	actual := Digest("sha256:" + hex.EncodeToString(sum))
 	if actual != expected {
 		return BlobInfo{}, fmt.Errorf("%w: declared %s, computed %s", ErrDigestMismatch, expected, actual)
+	}
+
+	// 已存在且校验通过：直接命中，内容寻址保证同一摘要即同一份内容。
+	if existed {
+		return BlobInfo{Digest: expected, Size: size}, nil
 	}
 
 	dst := s.blobPath(expected)
@@ -113,11 +125,6 @@ func (s *Store) Put(expected Digest, size int64, r io.Reader) (BlobInfo, error) 
 		return BlobInfo{}, err
 	}
 	return BlobInfo{Digest: expected, Size: size}, nil
-}
-
-// copyCounting 将 r 同时写入 w 与 h，返回字节数。
-func copyCounting(w io.Writer, h hash.Hash, r io.Reader) (int64, error) {
-	return io.Copy(io.MultiWriter(w, h), r)
 }
 
 func (s *Store) stat(d Digest) (BlobInfo, bool) {
